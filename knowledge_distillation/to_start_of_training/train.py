@@ -1,8 +1,3 @@
-import torch.distributed as dist
-import torch.sagemaker as tsm
-import smdistributed.dataparallel.torch.torch_smddp
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 import argparse
 from transformers import (
     AutoTokenizer,
@@ -133,7 +128,7 @@ class DistillationTrainer(Trainer):
     def __init__(self, *args, teacher_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher = teacher_model
-        # self._move_model_to_device(self.teacher, self.model.device)
+        self._move_model_to_device(self.teacher, self.model.device)
         self.teacher.eval()
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -142,7 +137,9 @@ class DistillationTrainer(Trainer):
         with torch.no_grad():
             outputs_teacher = self.teacher(**inputs)
 
-        assert (outputs_student.logits.size() == outputs_teacher.logits.size())
+        assert (
+                outputs_student.logits.size() == outputs_teacher.logits.size()
+        )
 
         loss_function = nn.KLDivLoss(reduction="batchmean")
         loss_logits = loss_function(
@@ -164,17 +161,14 @@ def training_function(args):
     teacher_model = MistralForCausalLM.from_pretrained(args.teacher_model_id, cache_dir="/tmp")
     student_model = MistralForCausalLM.from_pretrained(args.student_model_id, cache_dir="/tmp")
 
-    teacher_model = FSDP(teacher_model)
-    student_model = FSDP(student_model)
-
     accuracy_metric = load_metric("accuracy")
 
     training_args = DistillationTrainingArguments(
         output_dir="/opt/ml/model/",
         num_train_epochs=args.num_epochs,
-        auto_find_batch_size=True,
-        # per_device_train_batch_size=2,
-        # per_device_eval_batch_size=2,
+        # auto_find_batch_size=True,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
         fp16=args.fp16,
         learning_rate=args.lr,
         evaluation_strategy=args.evaluation_strategy,
@@ -184,7 +178,6 @@ def training_function(args):
         metric_for_best_model="accuracy",
         alpha=args.alpha,
         temperature=args.temperature,
-        remove_unused_columns=False
     )
 
     trainer = DistillationTrainer(
@@ -203,8 +196,6 @@ def training_function(args):
 
 def main():
     args, _ = parse_arge()
-    dist.init_process_group("smddp")
-    tsm.init()
     training_function(args)
 
 

@@ -1,3 +1,6 @@
-setfit
-datasets
-scikit-learn
+typing==3.7.4.3
+datasets==2.16.1
+scikit-learn==1.4.0
+dataclasses==0.6
+transformers==4.37.1
+evaluate==0.4.1

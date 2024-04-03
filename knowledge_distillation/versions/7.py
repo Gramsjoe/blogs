@@ -1,24 +1,31 @@
+import functools
+
 import torch.distributed as dist
 import torch.sagemaker as tsm
 import smdistributed.dataparallel.torch.torch_smddp
+from torch.distributed.fsdp import MixedPrecision
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 import argparse
 from transformers import (
     AutoTokenizer,
     TrainingArguments,
     Trainer,
-    MistralForCausalLM,
+    DataCollatorWithPadding,
+    AutoModelForSequenceClassification
 )
-from datasets import load_metric, Dataset
-from dataclasses import dataclass
-from transformers.tokenization_utils_base import PreTrainedTokenizerBase, PaddingStrategy
-from typing import Union
+from datasets import Dataset
+import evaluate
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+
+mixed_precision_policy = MixedPrecision(
+    param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16, buffer_dtype=torch.bfloat16
+)
 
 
 def parse_arge():
@@ -86,39 +93,7 @@ def parse_arge():
 def compute_metrics(eval_pred):
     predictions, labels = eval_pred
     predictions = np.argmax(predictions, axis=1)
-    acc = accuracy_metric.compute(
-        predictions=predictions, references=labels
-    )
-    return {
-        "accuracy": acc["accuracy"],
-    }
-
-
-@dataclass
-class DataCollatorForMultipleChoice:
-    tokenizer: PreTrainedTokenizerBase
-    padding: Union[bool, str, PaddingStrategy] = True
-
-    def __call__(self, features):
-        labels = [feature.pop("answer") for feature in features]
-        batch_size = len(features)
-        num_choices = len(features[0]["input_ids"])
-
-        flattened_features = [
-            [{k: v[i] for k, v in feature.items()} for i in range(num_choices)] for feature in features
-        ]
-        flattened_features = sum(flattened_features, [])
-
-        batch = self.tokenizer.pad(
-            flattened_features,
-            padding=self.padding,
-            return_tensors="pt",
-        )
-
-        batch = {k: v.view(batch_size, num_choices, -1) for k, v in batch.items()}
-        batch["labels"] = torch.tensor(labels, dtype=torch.int64)
-
-        return batch
+    return accuracy.compute(predictions=predictions, references=labels)
 
 
 class DistillationTrainingArguments(TrainingArguments):
@@ -133,7 +108,6 @@ class DistillationTrainer(Trainer):
     def __init__(self, *args, teacher_model=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.teacher = teacher_model
-        # self._move_model_to_device(self.teacher, self.model.device)
         self.teacher.eval()
 
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -155,36 +129,50 @@ class DistillationTrainer(Trainer):
 
 
 def training_function(args):
-    train_dataset = Dataset.from_file("/opt/ml/input/data/train_data/data-00000-of-00001.arrow")
-    test_dataset = Dataset.from_file("/opt/ml/input/data/test_data/data-00000-of-00001.arrow")
+    train_dataset = Dataset.from_file("/opt/ml/input/data/train/data-00000-of-00001.arrow")
+    test_dataset = Dataset.from_file("/opt/ml/input/data/test/data-00000-of-00001.arrow")
 
     tokenizer = AutoTokenizer.from_pretrained(args.teacher_model_id)
     tokenizer.pad_token = tokenizer.eos_token
 
-    teacher_model = MistralForCausalLM.from_pretrained(args.teacher_model_id, cache_dir="/tmp")
-    student_model = MistralForCausalLM.from_pretrained(args.student_model_id, cache_dir="/tmp")
+    id2label = {0: "NEGATIVE", 1: "POSITIVE"}
+    label2id = {"NEGATIVE": 0, "POSITIVE": 1}
 
-    teacher_model = FSDP(teacher_model)
-    student_model = FSDP(student_model)
+    teacher_model = AutoModelForSequenceClassification.from_pretrained(args.teacher_model_id, num_labels=2,
+                                                                       id2label=id2label, label2id=label2id,
+                                                                       cache_dir="/tmp", torch_dtype=torch.bfloat16,
+                                                                       low_cpu_mem_usage=True, device_map="auto")
+    student_model = AutoModelForSequenceClassification.from_pretrained(args.student_model_id, num_labels=2,
+                                                                       id2label=id2label, label2id=label2id,
+                                                                       cache_dir="/tmp", torch_dtype=torch.bfloat16,
+                                                                       low_cpu_mem_usage=True, device_map="auto")
 
-    accuracy_metric = load_metric("accuracy")
+    teacher_model = FSDP(
+        teacher_model,
+        mixed_precision=mixed_precision_policy,
+        device_id=torch.cuda.current_device(),
+        auto_wrap_policy=functools.partial(size_based_auto_wrap_policy,)
+    )
+    student_model = FSDP(
+        student_model,
+        mixed_precision=mixed_precision_policy,
+        device_id=torch.cuda.current_device(),
+        auto_wrap_policy=functools.partial(size_based_auto_wrap_policy,)
+    )
+
+    accuracy = evaluate.load("accuracy")
 
     training_args = DistillationTrainingArguments(
         output_dir="/opt/ml/model/",
         num_train_epochs=args.num_epochs,
-        auto_find_batch_size=True,
-        # per_device_train_batch_size=2,
-        # per_device_eval_batch_size=2,
-        fp16=args.fp16,
+        per_device_train_batch_size=2,
+        per_device_eval_batch_size=2,
+        bf16=True,
         learning_rate=args.lr,
         evaluation_strategy=args.evaluation_strategy,
-        save_strategy=args.save_strategy,
-        save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
         alpha=args.alpha,
         temperature=args.temperature,
-        remove_unused_columns=False
+        remove_unused_columns=False,
     )
 
     trainer = DistillationTrainer(
@@ -193,7 +181,7 @@ def training_function(args):
         teacher_model=teacher_model,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
-        data_collator=DataCollatorForMultipleChoice(tokenizer=tokenizer),
+        data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
         tokenizer=tokenizer,
         compute_metrics=compute_metrics,
     )
