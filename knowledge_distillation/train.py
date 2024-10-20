@@ -38,7 +38,7 @@ def parse_arge():
     parser.add_argument("--temperature", type=float, default=8.0)
     parser.add_argument("--alpha", type=float, default=0.5)
     parser.add_argument("--batch", type=int, default=2)
-    parser.add_argument("--hf_token", type=str, default="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")
+    parser.add_argument("--hf_token", type=str, default="hf_xxxxxxxxxxxxxxxxx")
     parser.add_argument("--dist_backend", type=str, default="smddp")
 
     args = parser.parse_known_args()
