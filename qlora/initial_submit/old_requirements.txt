@@ -1,8 +1,0 @@
-transformers
-peft
-accelerate
-bitsandbytes
-safetensors
-tokenizers
-datasets
-pandas
